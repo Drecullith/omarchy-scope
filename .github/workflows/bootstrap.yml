@@ -1,0 +1,40 @@
+name: bootstrap-scope
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reassemble build archive
+        run: |
+          cat .bootstrap/bundle.part* | base64 -d > /tmp/omarchy-scope.zip
+          rm -rf /tmp/omarchy-scope-unpack
+          mkdir -p /tmp/omarchy-scope-unpack
+          unzip -q /tmp/omarchy-scope.zip -d /tmp/omarchy-scope-unpack
+      - name: Materialize SCOPE v0.1.0
+        run: |
+          cp -a /tmp/omarchy-scope-unpack/omarchy-scope/. .
+          chmod 0755 bin/scope-helper
+          rm -rf .bootstrap
+          rm -f .github/workflows/bootstrap.yml
+      - name: Verify build
+        run: |
+          python3 -m py_compile bin/scope-helper
+          python3 -m unittest discover -s tests -v
+          git diff --check
+      - name: Commit build
+        run: |
+          git config user.name "Drecullith"
+          git config user.email "84670591+Drecullith@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "Build SCOPE v0.1.0 engagement HUD"
+          git push origin HEAD:main
