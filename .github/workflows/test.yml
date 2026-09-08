@@ -1,0 +1,19 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile helper
+        run: python3 -m py_compile bin/scope-helper
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -v
