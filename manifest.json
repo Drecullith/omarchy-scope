@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.drecullith.scope",
+  "name": "SCOPE",
+  "version": "0.1.0",
+  "author": "Drecullith",
+  "description": "Scope-first active engagement HUD for ethical hacking, CTFs, labs, research, and authorized pentests",
+  "homepage": "https://github.com/Drecullith/omarchy-scope",
+  "license": "MIT",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "SCOPE",
+    "description": "Keep authorized targets, routes, imported services, quarantine, and engagement context in view",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "panelWidth": 560
+    }
+  }
+}

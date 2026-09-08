@@ -1,0 +1,850 @@
+#!/usr/bin/env python3
+"""Local helper for the SCOPE Omarchy plugin.
+
+SCOPE is intentionally read-mostly. This helper never scans targets, listens on
+network sockets, changes routes/firewalls, escalates privileges, or executes
+untrusted data as code. It validates scope, parses explicitly supplied Nmap XML,
+checks the current kernel route for an in-scope IP, and stores bounded local
+engagement state.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from typing import Any, Iterable
+import xml.etree.ElementTree as ET
+
+SCHEMA_VERSION = 1
+MAX_STATE_BYTES = 2 * 1024 * 1024
+MAX_NMAP_BYTES = 5 * 1024 * 1024
+MAX_SCOPE_TEXT = 16 * 1024
+MAX_SCOPE_RULES = 256
+MAX_TARGETS = 256
+MAX_QUARANTINE = 256
+MAX_PORTS_PER_TARGET = 256
+MAX_TIMELINE = 500
+MAX_NOTE = 500
+MAX_NAME = 80
+MAX_HOSTNAME = 253
+MAX_SERVICE = 48
+MAX_SOURCE_NAME = 120
+ALLOWED_KINDS = {"lab", "ctf", "client", "research"}
+HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+class ScopeError(Exception):
+    def __init__(self, message: str, code: str = "invalid") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _safe_text(value: Any, limit: int) -> str:
+    text = CONTROL_RE.sub("", str(value or "")).strip()
+    if len(text) > limit:
+        text = text[:limit]
+    return text
+
+
+def _state_root() -> Path:
+    base = os.environ.get("XDG_STATE_HOME")
+    if base:
+        return Path(base) / "omarchy-scope"
+    return Path.home() / ".local" / "state" / "omarchy-scope"
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = path.lstat()
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise ScopeError("State path is not a real directory", "unsafe-state-path")
+    if st.st_uid != os.getuid():
+        raise ScopeError("State directory is not owned by the current user", "unsafe-state-owner")
+    # Tighten an existing directory rather than silently accepting group/world access.
+    os.chmod(path, 0o700)
+
+
+def _open_nofollow(path: Path) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.open(path, flags)
+
+
+def _default_state() -> dict[str, Any]:
+    return {"schemaVersion": SCHEMA_VERSION, "active": False, "engagement": None}
+
+
+def _load_state_unlocked() -> dict[str, Any]:
+    root = _state_root()
+    _ensure_private_dir(root)
+    path = root / "state.json"
+    try:
+        fd = _open_nofollow(path)
+    except FileNotFoundError:
+        return _default_state()
+    except OSError as exc:
+        raise ScopeError(f"Could not safely open state: {exc}", "state-read-failed") from exc
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ScopeError("State file is not a regular file", "unsafe-state-file")
+        if st.st_uid != os.getuid():
+            raise ScopeError("State file is not owned by the current user", "unsafe-state-owner")
+        if st.st_size > MAX_STATE_BYTES:
+            raise ScopeError("State file is unexpectedly large", "state-too-large")
+        chunks = []
+        remaining = MAX_STATE_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_STATE_BYTES:
+            raise ScopeError("State file is unexpectedly large", "state-too-large")
+    finally:
+        os.close(fd)
+
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ScopeError("State file is not valid JSON", "state-corrupt") from exc
+    if not isinstance(value, dict) or value.get("schemaVersion") != SCHEMA_VERSION:
+        raise ScopeError("Unsupported or corrupt state schema", "state-schema")
+    return value
+
+
+def _save_state_unlocked(state_obj: dict[str, Any]) -> None:
+    root = _state_root()
+    _ensure_private_dir(root)
+    payload = json.dumps(state_obj, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    if len(payload) > MAX_STATE_BYTES:
+        raise ScopeError("Refusing to write oversized state", "state-too-large")
+
+    fd, temp_path = tempfile.mkstemp(prefix=".state-", dir=str(root))
+    temp = Path(temp_path)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, root / "state.json")
+        dir_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _with_state_lock(exclusive: bool):
+    root = _state_root()
+    _ensure_private_dir(root)
+    lock_path = root / "state.lock"
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(lock_path, flags, 0o600)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        os.close(fd)
+        raise ScopeError("State lock is not a safe current-user file", "unsafe-state-lock")
+    os.fchmod(fd, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    return fd
+
+
+def load_state() -> dict[str, Any]:
+    fd = _with_state_lock(False)
+    try:
+        return _load_state_unlocked()
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def mutate_state(mutator):
+    fd = _with_state_lock(True)
+    try:
+        state_obj = _load_state_unlocked()
+        result = mutator(state_obj)
+        _save_state_unlocked(state_obj)
+        return result
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _validate_hostname(value: str) -> str:
+    name = value.strip().lower().rstrip(".")
+    if not name or len(name) > MAX_HOSTNAME or any(ord(ch) > 127 for ch in name):
+        raise ScopeError(f"Invalid hostname scope: {value!r}", "invalid-scope")
+    labels = name.split(".")
+    if any(not HOST_LABEL_RE.fullmatch(label) for label in labels):
+        raise ScopeError(f"Invalid hostname scope: {value!r}", "invalid-scope")
+    return name
+
+
+def parse_scope_text(text: str) -> list[dict[str, Any]]:
+    if not isinstance(text, str) or len(text.encode("utf-8", "ignore")) > MAX_SCOPE_TEXT:
+        raise ScopeError("Scope text is too large", "scope-too-large")
+
+    rules: list[dict[str, Any]] = []
+    # One rule per line is intentionally boring and reviewable. Empty lines and
+    # full-line # comments are ignored.
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        exclude = line.startswith("!")
+        token = line[1:].strip() if exclude else line
+        if not token:
+            raise ScopeError("Empty exclusion rule", "invalid-scope")
+
+        if len(rules) >= MAX_SCOPE_RULES:
+            raise ScopeError("Too many scope rules", "scope-too-large")
+
+        rule: dict[str, Any]
+        try:
+            if "/" in token:
+                # strict=True prevents accidental scope widening such as
+                # 10.10.11.42/24 silently becoming 10.10.11.0/24.
+                network = ipaddress.ip_network(token, strict=True)
+                rule = {
+                    "kind": "network",
+                    "value": str(network),
+                    "version": network.version,
+                    "exclude": exclude,
+                }
+            else:
+                address = ipaddress.ip_address(token)
+                rule = {
+                    "kind": "ip",
+                    "value": str(address),
+                    "version": address.version,
+                    "exclude": exclude,
+                }
+        except ValueError:
+            if token.startswith("*."):
+                base = _validate_hostname(token[2:])
+                rule = {"kind": "wildcard-hostname", "value": base, "exclude": exclude}
+            else:
+                hostname = _validate_hostname(token)
+                rule = {"kind": "hostname", "value": hostname, "exclude": exclude}
+
+        rule["raw"] = ("!" if exclude else "") + (
+            "*." + rule["value"] if rule["kind"] == "wildcard-hostname" else rule["value"]
+        )
+        rules.append(rule)
+
+    if not rules:
+        raise ScopeError("Add at least one scope rule", "empty-scope")
+    if not any(not rule["exclude"] for rule in rules):
+        raise ScopeError("Scope must contain at least one positive rule", "empty-scope")
+    return rules
+
+
+def _target_identity(target: str) -> tuple[str, Any]:
+    text = _safe_text(target, MAX_HOSTNAME)
+    if not text:
+        raise ScopeError("Target is empty", "invalid-target")
+    try:
+        address = ipaddress.ip_address(text)
+        return "ip", address
+    except ValueError:
+        return "hostname", _validate_hostname(text)
+
+
+def scope_decision(target: str, rules: list[dict[str, Any]]) -> dict[str, Any]:
+    target_kind, identity = _target_identity(target)
+    positive_matches: list[str] = []
+    exclusion_matches: list[str] = []
+
+    for rule in rules:
+        match = False
+        if target_kind == "ip" and rule["kind"] in {"ip", "network"}:
+            if identity.version != rule.get("version"):
+                continue
+            if rule["kind"] == "ip":
+                match = identity == ipaddress.ip_address(rule["value"])
+            else:
+                match = identity in ipaddress.ip_network(rule["value"], strict=True)
+        elif target_kind == "hostname" and rule["kind"] in {"hostname", "wildcard-hostname"}:
+            if rule["kind"] == "hostname":
+                match = identity == rule["value"]
+            else:
+                # '*.example.com' does not implicitly include example.com.
+                match = identity.endswith("." + rule["value"])
+
+        if match:
+            (exclusion_matches if rule["exclude"] else positive_matches).append(rule["raw"])
+
+    allowed = bool(positive_matches) and not exclusion_matches
+    return {
+        "target": str(identity),
+        "targetKind": target_kind,
+        "allowed": allowed,
+        "verdict": "in-scope" if allowed else "out-of-scope",
+        "matched": positive_matches,
+        "excludedBy": exclusion_matches,
+    }
+
+
+def _timeline(engagement: dict[str, Any], event_type: str, message: str, **extra: Any) -> None:
+    event = {
+        "at": utc_now(),
+        "type": _safe_text(event_type, 32),
+        "message": _safe_text(message, 240),
+    }
+    for key, value in extra.items():
+        event[key] = value
+    engagement.setdefault("timeline", []).append(event)
+    if len(engagement["timeline"]) > MAX_TIMELINE:
+        engagement["timeline"] = engagement["timeline"][-MAX_TIMELINE:]
+
+
+def _route_lookup(target: str) -> dict[str, Any]:
+    try:
+        address = ipaddress.ip_address(target)
+    except ValueError as exc:
+        raise ScopeError("Route Guard only accepts literal IP targets", "route-needs-ip") from exc
+
+    ip_cmd = Path("/usr/bin/ip")
+    if not ip_cmd.exists():
+        return {"known": False, "reason": "ip-command-unavailable", "target": str(address)}
+
+    try:
+        proc = subprocess.run(
+            [str(ip_cmd), "-j", "route", "get", str(address)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2.0,
+            check=False,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"known": False, "reason": "route-query-failed", "target": str(address)}
+
+    if proc.returncode != 0 or len(proc.stdout.encode("utf-8", "ignore")) > 64 * 1024:
+        return {"known": False, "reason": "route-query-failed", "target": str(address)}
+    try:
+        rows = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"known": False, "reason": "route-query-invalid", "target": str(address)}
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return {"known": False, "reason": "route-query-empty", "target": str(address)}
+
+    row = rows[0]
+    dev = _safe_text(row.get("dev"), 64)
+    if not dev:
+        return {"known": False, "reason": "route-device-unknown", "target": str(address)}
+    return {
+        "known": True,
+        "target": str(address),
+        "dev": dev,
+        "gateway": _safe_text(row.get("gateway"), 80),
+        "source": _safe_text(row.get("prefsrc"), 80),
+    }
+
+
+def _route_fingerprint(route: dict[str, Any]) -> dict[str, str]:
+    return {
+        "target": _safe_text(route.get("target"), 80),
+        "dev": _safe_text(route.get("dev"), 64),
+        "gateway": _safe_text(route.get("gateway"), 80),
+    }
+
+
+def _route_for_engagement(engagement: dict[str, Any], target: str) -> dict[str, Any]:
+    decision = scope_decision(target, engagement.get("scope", []))
+    if not decision["allowed"]:
+        return {"status": "ok", "scope": decision, "route": {"known": False, "verdict": "blocked"}}
+
+    current = _route_lookup(decision["target"])
+    baseline = engagement.get("routeBaseline")
+    if not current.get("known"):
+        current["verdict"] = "unknown"
+    elif not baseline or baseline.get("target") != current.get("target"):
+        current["verdict"] = "unbaselined"
+    elif _route_fingerprint(current) == _route_fingerprint(baseline):
+        current["verdict"] = "match"
+    else:
+        current["verdict"] = "changed"
+        current["baseline"] = baseline
+    return {"status": "ok", "scope": decision, "route": current}
+
+
+def _capture_route_baseline_if_possible(engagement: dict[str, Any], target: str | None) -> None:
+    if not target or engagement.get("routeBaseline"):
+        return
+    try:
+        decision = scope_decision(target, engagement.get("scope", []))
+    except ScopeError:
+        return
+    if not decision["allowed"] or decision["targetKind"] != "ip":
+        return
+    route = _route_lookup(decision["target"])
+    if route.get("known"):
+        engagement["routeBaseline"] = {**_route_fingerprint(route), "capturedAt": utc_now()}
+        _timeline(engagement, "route", f"Route baseline captured via {route['dev']}")
+
+
+def _positive_exact_ip(rules: list[dict[str, Any]]) -> str | None:
+    for rule in rules:
+        if not rule.get("exclude") and rule.get("kind") == "ip":
+            return rule["value"]
+    return None
+
+
+def _require_active(state_obj: dict[str, Any]) -> dict[str, Any]:
+    engagement = state_obj.get("engagement")
+    if not state_obj.get("active") or not isinstance(engagement, dict):
+        raise ScopeError("No active engagement", "no-active-engagement")
+    return engagement
+
+
+def _read_nmap_file(path_text: str) -> tuple[bytes, str]:
+    path = Path(path_text).expanduser()
+    try:
+        fd = _open_nofollow(path)
+    except FileNotFoundError as exc:
+        raise ScopeError("Nmap XML file does not exist", "import-not-found") from exc
+    except OSError as exc:
+        raise ScopeError(f"Could not safely open Nmap XML: {exc}", "import-open-failed") from exc
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ScopeError("Nmap import must be a regular file", "import-not-regular")
+        if st.st_size > MAX_NMAP_BYTES:
+            raise ScopeError("Nmap XML exceeds the 5 MiB import limit", "import-too-large")
+        data = b""
+        remaining = MAX_NMAP_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            data += chunk
+            remaining -= len(chunk)
+        if len(data) > MAX_NMAP_BYTES:
+            raise ScopeError("Nmap XML exceeds the 5 MiB import limit", "import-too-large")
+    finally:
+        os.close(fd)
+
+    upper = data.upper()
+    if b"<!DOCTYPE" in upper or b"<!ENTITY" in upper:
+        raise ScopeError("DTD/entity declarations are not accepted in Nmap imports", "import-unsafe-xml")
+    return data, _safe_text(path.name, MAX_SOURCE_NAME) or "scan.xml"
+
+
+def _clean_hostname_metadata(value: str) -> str | None:
+    try:
+        return _validate_hostname(_safe_text(value, MAX_HOSTNAME))
+    except ScopeError:
+        return None
+
+
+def _parse_nmap(data: bytes) -> list[dict[str, Any]]:
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise ScopeError("Nmap XML is malformed", "import-malformed") from exc
+    if root.tag.split("}")[-1] != "nmaprun":
+        raise ScopeError("File is not an Nmap XML document", "import-not-nmap")
+
+    hosts: list[dict[str, Any]] = []
+    for host in root.findall(".//host"):
+        if len(hosts) >= MAX_TARGETS + MAX_QUARANTINE:
+            raise ScopeError("Nmap XML contains too many hosts", "import-too-many-hosts")
+
+        address_value: str | None = None
+        for address in host.findall("address"):
+            addrtype = address.attrib.get("addrtype", "")
+            if addrtype not in {"ipv4", "ipv6"}:
+                continue
+            candidate = address.attrib.get("addr", "")
+            try:
+                address_value = str(ipaddress.ip_address(candidate))
+                break
+            except ValueError:
+                continue
+        if not address_value:
+            continue
+
+        status_node = host.find("status")
+        host_state = _safe_text(status_node.attrib.get("state") if status_node is not None else "", 16)
+
+        hostnames: list[str] = []
+        for hn in host.findall("./hostnames/hostname")[:8]:
+            clean = _clean_hostname_metadata(hn.attrib.get("name", ""))
+            if clean and clean not in hostnames:
+                hostnames.append(clean)
+
+        services: list[dict[str, Any]] = []
+        for port in host.findall("./ports/port"):
+            if len(services) >= MAX_PORTS_PER_TARGET:
+                break
+            try:
+                port_id = int(port.attrib.get("portid", "0"))
+            except ValueError:
+                continue
+            if not (1 <= port_id <= 65535):
+                continue
+            protocol = port.attrib.get("protocol", "")
+            if protocol not in {"tcp", "udp", "sctp"}:
+                continue
+            state_node = port.find("state")
+            port_state = state_node.attrib.get("state", "") if state_node is not None else ""
+            if port_state != "open":
+                continue
+            service_node = port.find("service")
+            service = _safe_text(service_node.attrib.get("name") if service_node is not None else "", MAX_SERVICE)
+            services.append({
+                "port": port_id,
+                "protocol": protocol,
+                "state": "open",
+                "service": service or "unknown",
+            })
+
+        hosts.append({
+            "address": address_value,
+            "state": host_state or "unknown",
+            "hostnames": hostnames,
+            "services": services,
+        })
+    return hosts
+
+
+def _merge_target(existing: list[dict[str, Any]], incoming: dict[str, Any], source: str) -> None:
+    address = incoming["address"]
+    target = next((item for item in existing if item.get("address") == address), None)
+    if target is None:
+        if len(existing) >= MAX_TARGETS:
+            raise ScopeError("Engagement has reached the target limit", "too-many-targets")
+        target = {
+            "address": address,
+            "hostnames": [],
+            "services": [],
+            "lastSource": source,
+            "updatedAt": utc_now(),
+        }
+        existing.append(target)
+
+    for hostname in incoming.get("hostnames", [])[:8]:
+        if hostname not in target["hostnames"]:
+            target["hostnames"].append(hostname)
+    service_map = {(item["protocol"], int(item["port"])): item for item in target.get("services", [])}
+    for service in incoming.get("services", [])[:MAX_PORTS_PER_TARGET]:
+        service_map[(service["protocol"], int(service["port"]))] = service
+    target["services"] = sorted(service_map.values(), key=lambda item: (item["protocol"], int(item["port"])))[:MAX_PORTS_PER_TARGET]
+    target["lastSource"] = source
+    target["updatedAt"] = utc_now()
+
+
+def _merge_quarantine(existing: list[dict[str, Any]], incoming: dict[str, Any], source: str) -> None:
+    address = incoming["address"]
+    item = next((entry for entry in existing if entry.get("address") == address), None)
+    if item is None:
+        if len(existing) >= MAX_QUARANTINE:
+            raise ScopeError("Quarantine has reached its target limit", "too-many-quarantined")
+        item = {"address": address}
+        existing.append(item)
+    item.update({
+        "hostnames": incoming.get("hostnames", [])[:8],
+        "services": incoming.get("services", [])[:MAX_PORTS_PER_TARGET],
+        "source": source,
+        "updatedAt": utc_now(),
+        "reason": "out-of-scope",
+    })
+
+
+
+def cmd_doctor(_args: argparse.Namespace) -> dict[str, Any]:
+    checks = {
+        "python": {"ok": True, "detail": sys.version.split()[0]},
+        "ip": {"ok": Path("/usr/bin/ip").is_file(), "detail": "/usr/bin/ip"},
+        "xdgOpen": {"ok": shutil.which("xdg-open") is not None, "detail": shutil.which("xdg-open") or ""},
+        "wlCopy": {"ok": shutil.which("wl-copy") is not None, "detail": shutil.which("wl-copy") or ""},
+    }
+    return {"status": "ok", "checks": checks, "coreReady": checks["python"]["ok"]}
+
+def cmd_status(_args: argparse.Namespace) -> dict[str, Any]:
+    state_obj = load_state()
+    return {"status": "ok", **state_obj}
+
+
+def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
+    name = _safe_text(args.name, MAX_NAME)
+    kind = _safe_text(args.kind, 16).lower()
+    if not name:
+        raise ScopeError("Engagement name is required", "invalid-name")
+    if kind not in ALLOWED_KINDS:
+        raise ScopeError("Engagement type must be lab, ctf, client, or research", "invalid-kind")
+    rules = parse_scope_text(args.scope)
+
+    def mutate(state_obj: dict[str, Any]) -> dict[str, Any]:
+        if state_obj.get("active"):
+            raise ScopeError("End the current engagement before starting another", "engagement-active")
+        engagement = {
+            "id": secrets.token_hex(8),
+            "name": name,
+            "kind": kind,
+            "startedAt": utc_now(),
+            "scope": rules,
+            "targets": [],
+            "quarantine": [],
+            "timeline": [],
+            "primaryTarget": _positive_exact_ip(rules),
+            "routeBaseline": None,
+        }
+        _timeline(engagement, "engagement", f"{kind.upper()} engagement created")
+        _timeline(engagement, "scope", f"Scope validated ({len(rules)} rule{'s' if len(rules) != 1 else ''})")
+        _capture_route_baseline_if_possible(engagement, engagement.get("primaryTarget"))
+        state_obj.clear()
+        state_obj.update({"schemaVersion": SCHEMA_VERSION, "active": True, "engagement": engagement})
+        return {"status": "ok", "message": "Engagement started", "engagement": engagement}
+
+    return mutate_state(mutate)
+
+
+def cmd_end(_args: argparse.Namespace) -> dict[str, Any]:
+    def mutate(state_obj: dict[str, Any]) -> dict[str, Any]:
+        engagement = _require_active(state_obj)
+        _timeline(engagement, "engagement", "Engagement ended")
+        engagement["endedAt"] = utc_now()
+        state_obj["active"] = False
+        return {"status": "ok", "message": "Engagement ended", "engagement": engagement}
+
+    return mutate_state(mutate)
+
+
+def cmd_note(args: argparse.Namespace) -> dict[str, Any]:
+    text = _safe_text(args.text, MAX_NOTE)
+    if not text:
+        raise ScopeError("Note is empty", "empty-note")
+
+    def mutate(state_obj: dict[str, Any]) -> dict[str, Any]:
+        engagement = _require_active(state_obj)
+        _timeline(engagement, "note", text)
+        return {"status": "ok", "message": "Note added"}
+
+    return mutate_state(mutate)
+
+
+def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
+    state_obj = load_state()
+    engagement = _require_active(state_obj)
+    return {"status": "ok", **scope_decision(args.target, engagement.get("scope", []))}
+
+
+def cmd_import_nmap(args: argparse.Namespace) -> dict[str, Any]:
+    data, source = _read_nmap_file(args.path)
+    hosts = _parse_nmap(data)
+
+    def mutate(state_obj: dict[str, Any]) -> dict[str, Any]:
+        engagement = _require_active(state_obj)
+        allowed_count = 0
+        quarantined_count = 0
+        service_count = 0
+        for host in hosts:
+            # Deliberately check the literal address only. A hostname advertised
+            # by a scanned host is untrusted metadata and cannot authorize an IP.
+            decision = scope_decision(host["address"], engagement.get("scope", []))
+            if decision["allowed"]:
+                _merge_target(engagement.setdefault("targets", []), host, source)
+                allowed_count += 1
+                service_count += len(host.get("services", []))
+                if not engagement.get("primaryTarget"):
+                    engagement["primaryTarget"] = host["address"]
+            else:
+                _merge_quarantine(engagement.setdefault("quarantine", []), host, source)
+                quarantined_count += 1
+
+        _capture_route_baseline_if_possible(engagement, engagement.get("primaryTarget"))
+        _timeline(
+            engagement,
+            "import",
+            f"Imported {source}: {allowed_count} in scope, {quarantined_count} quarantined",
+            source=source,
+            allowed=allowed_count,
+            quarantined=quarantined_count,
+            services=service_count,
+        )
+        return {
+            "status": "ok",
+            "message": f"Imported {source}",
+            "source": source,
+            "hostsSeen": len(hosts),
+            "allowed": allowed_count,
+            "quarantined": quarantined_count,
+            "services": service_count,
+        }
+
+    return mutate_state(mutate)
+
+
+
+def cmd_primary(args: argparse.Namespace) -> dict[str, Any]:
+    def mutate(state_obj: dict[str, Any]) -> dict[str, Any]:
+        engagement = _require_active(state_obj)
+        decision = scope_decision(args.target, engagement.get("scope", []))
+        if not decision["allowed"] or decision["targetKind"] != "ip":
+            raise ScopeError("Primary target must be an in-scope literal IP", "primary-target-blocked")
+        engagement["primaryTarget"] = decision["target"]
+        engagement["routeBaseline"] = None
+        _timeline(engagement, "target", f"Primary target set to {decision['target']}")
+        _capture_route_baseline_if_possible(engagement, decision["target"])
+        return {"status": "ok", "message": "Primary target updated", "target": decision["target"]}
+
+    return mutate_state(mutate)
+
+def cmd_route(args: argparse.Namespace) -> dict[str, Any]:
+    state_obj = load_state()
+    engagement = _require_active(state_obj)
+    return _route_for_engagement(engagement, args.target)
+
+
+def cmd_rebaseline_route(args: argparse.Namespace) -> dict[str, Any]:
+    def mutate(state_obj: dict[str, Any]) -> dict[str, Any]:
+        engagement = _require_active(state_obj)
+        decision = scope_decision(args.target, engagement.get("scope", []))
+        if not decision["allowed"] or decision["targetKind"] != "ip":
+            raise ScopeError("Route baseline target must be an in-scope IP", "route-blocked")
+        route = _route_lookup(decision["target"])
+        if not route.get("known"):
+            raise ScopeError("Current route is unknown; baseline not changed", "route-unknown")
+        engagement["routeBaseline"] = {**_route_fingerprint(route), "capturedAt": utc_now()}
+        _timeline(engagement, "route", f"Route baseline updated via {route['dev']}")
+        return {"status": "ok", "message": "Route baseline updated", "route": engagement["routeBaseline"]}
+
+    return mutate_state(mutate)
+
+
+def cmd_url(args: argparse.Namespace) -> dict[str, Any]:
+    state_obj = load_state()
+    engagement = _require_active(state_obj)
+    decision = scope_decision(args.target, engagement.get("scope", []))
+    if not decision["allowed"]:
+        return {"status": "ok", "allowed": False, "scope": decision}
+    scheme = args.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ScopeError("Only http and https actions are supported", "invalid-scheme")
+    try:
+        port = int(args.port)
+    except ValueError as exc:
+        raise ScopeError("Port must be a number", "invalid-port") from exc
+    if not 1 <= port <= 65535:
+        raise ScopeError("Port is out of range", "invalid-port")
+
+    host = decision["target"]
+    if decision["targetKind"] == "ip" and ipaddress.ip_address(host).version == 6:
+        host = f"[{host}]"
+    default_port = 80 if scheme == "http" else 443
+    port_part = "" if port == default_port else f":{port}"
+    return {
+        "status": "ok",
+        "allowed": True,
+        "scope": decision,
+        "url": f"{scheme}://{host}{port_part}/",
+    }
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="scope-helper", description="Local SCOPE engagement helper")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    doctor = sub.add_parser("doctor")
+    doctor.set_defaults(func=cmd_doctor)
+
+    status = sub.add_parser("status")
+    status.set_defaults(func=cmd_status)
+
+    start = sub.add_parser("start")
+    start.add_argument("name")
+    start.add_argument("kind")
+    start.add_argument("scope")
+    start.set_defaults(func=cmd_start)
+
+    end = sub.add_parser("end")
+    end.set_defaults(func=cmd_end)
+
+    note = sub.add_parser("note")
+    note.add_argument("text")
+    note.set_defaults(func=cmd_note)
+
+    check = sub.add_parser("check")
+    check.add_argument("target")
+    check.set_defaults(func=cmd_check)
+
+    imp = sub.add_parser("import-nmap")
+    imp.add_argument("path")
+    imp.set_defaults(func=cmd_import_nmap)
+
+    primary = sub.add_parser("primary")
+    primary.add_argument("target")
+    primary.set_defaults(func=cmd_primary)
+
+    route = sub.add_parser("route")
+    route.add_argument("target")
+    route.set_defaults(func=cmd_route)
+
+    rebaseline = sub.add_parser("route-baseline")
+    rebaseline.add_argument("target")
+    rebaseline.set_defaults(func=cmd_rebaseline_route)
+
+    url = sub.add_parser("url")
+    url.add_argument("target")
+    url.add_argument("scheme")
+    url.add_argument("port")
+    url.set_defaults(func=cmd_url)
+    return parser
+
+
+def emit(payload: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=True) + "\n")
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    try:
+        args = _build_parser().parse_args(list(argv) if argv is not None else None)
+        payload = args.func(args)
+        emit(payload)
+        return 0
+    except ScopeError as exc:
+        emit({"status": "error", "code": exc.code, "message": str(exc)})
+        return 2
+    except Exception as exc:  # fail closed without leaking a traceback into the shell UI
+        emit({"status": "error", "code": "internal-error", "message": "SCOPE helper failed safely"})
+        if os.environ.get("OMARCHY_SCOPE_DEBUG") == "1":
+            raise
+        return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
