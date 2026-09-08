@@ -19,7 +19,6 @@ import os
 from pathlib import Path
 import re
 import secrets
-import shutil
 import stat
 import subprocess
 import sys
@@ -43,7 +42,7 @@ MAX_SERVICE = 48
 MAX_SOURCE_NAME = 120
 ALLOWED_KINDS = {"lab", "ctf", "client", "research"}
 HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class ScopeError(Exception):
@@ -66,7 +65,10 @@ def _safe_text(value: Any, limit: int) -> str:
 def _state_root() -> Path:
     base = os.environ.get("XDG_STATE_HOME")
     if base:
-        return Path(base) / "omarchy-scope"
+        root = Path(base).expanduser()
+        if not root.is_absolute():
+            raise ScopeError("XDG_STATE_HOME must be an absolute path", "unsafe-state-path")
+        return root / "omarchy-scope"
     return Path.home() / ".local" / "state" / "omarchy-scope"
 
 
@@ -109,6 +111,7 @@ def _load_state_unlocked() -> dict[str, Any]:
             raise ScopeError("State file is not a regular file", "unsafe-state-file")
         if st.st_uid != os.getuid():
             raise ScopeError("State file is not owned by the current user", "unsafe-state-owner")
+        os.fchmod(fd, 0o600)
         if st.st_size > MAX_STATE_BYTES:
             raise ScopeError("State file is unexpectedly large", "state-too-large")
         chunks = []
@@ -444,14 +447,15 @@ def _read_nmap_file(path_text: str) -> tuple[bytes, str]:
             raise ScopeError("Nmap import must be a regular file", "import-not-regular")
         if st.st_size > MAX_NMAP_BYTES:
             raise ScopeError("Nmap XML exceeds the 5 MiB import limit", "import-too-large")
-        data = b""
+        chunks: list[bytes] = []
         remaining = MAX_NMAP_BYTES + 1
         while remaining > 0:
             chunk = os.read(fd, min(65536, remaining))
             if not chunk:
                 break
-            data += chunk
+            chunks.append(chunk)
             remaining -= len(chunk)
+        data = b"".join(chunks)
         if len(data) > MAX_NMAP_BYTES:
             raise ScopeError("Nmap XML exceeds the 5 MiB import limit", "import-too-large")
     finally:
@@ -575,9 +579,17 @@ def _merge_quarantine(existing: list[dict[str, Any]], incoming: dict[str, Any], 
             raise ScopeError("Quarantine has reached its target limit", "too-many-quarantined")
         item = {"address": address}
         existing.append(item)
+    hostnames = list(item.get("hostnames", []))
+    for hostname in incoming.get("hostnames", [])[:8]:
+        if hostname not in hostnames:
+            hostnames.append(hostname)
+    service_map = {(entry["protocol"], int(entry["port"])): entry for entry in item.get("services", [])}
+    for service in incoming.get("services", [])[:MAX_PORTS_PER_TARGET]:
+        service_map[(service["protocol"], int(service["port"]))] = service
+    services = sorted(service_map.values(), key=lambda entry: (entry["protocol"], int(entry["port"])))[:MAX_PORTS_PER_TARGET]
     item.update({
-        "hostnames": incoming.get("hostnames", [])[:8],
-        "services": incoming.get("services", [])[:MAX_PORTS_PER_TARGET],
+        "hostnames": hostnames[:8],
+        "services": services,
         "source": source,
         "updatedAt": utc_now(),
         "reason": "out-of-scope",
@@ -589,8 +601,8 @@ def cmd_doctor(_args: argparse.Namespace) -> dict[str, Any]:
     checks = {
         "python": {"ok": True, "detail": sys.version.split()[0]},
         "ip": {"ok": Path("/usr/bin/ip").is_file(), "detail": "/usr/bin/ip"},
-        "xdgOpen": {"ok": shutil.which("xdg-open") is not None, "detail": shutil.which("xdg-open") or ""},
-        "wlCopy": {"ok": shutil.which("wl-copy") is not None, "detail": shutil.which("wl-copy") or ""},
+        "xdgOpen": {"ok": Path("/usr/bin/xdg-open").is_file(), "detail": "/usr/bin/xdg-open"},
+        "wlCopy": {"ok": Path("/usr/bin/wl-copy").is_file(), "detail": "/usr/bin/wl-copy"},
     }
     return {"status": "ok", "checks": checks, "coreReady": checks["python"]["ok"]}
 

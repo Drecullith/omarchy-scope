@@ -9,6 +9,25 @@ python3 -m py_compile bin/scope-helper
 
 No network access is required for the test suite.
 
+
+## Static Quattro audit
+
+The pre-render audit is intentionally separate from the real-machine gate. Current source has been checked against the Quattro contracts for `Panel`, `KeyboardPanel`, `PanelKeyCatcher`, the third-party `PluginBarApi` facade, shared controls, and current plugin manifest validation.
+
+Static hardening in this pass includes:
+
+- plain-text rendering for every built-in QML `Text` surface
+- fixed `/usr/bin/xdg-open` and `/usr/bin/wl-copy` action paths
+- active-engagement-only status polling
+- compact vertical-bar rendering
+- bar-level route/quarantine alert states
+- long target-address elision
+- responsive engagement-type layout
+- state permission repair and absolute `XDG_STATE_HOME` enforcement
+- evidence-preserving quarantine re-import behavior
+
+This does **not** replace loading the plugin under a current Omarchy shell. QML type resolution, real geometry, font metrics, focus, drag/drop, and compositor behavior remain acceptance-test items below.
+
 ## Quattro integration gate
 
 Do not call v0.1 stable until these checks pass on a current Omarchy Quattro machine.

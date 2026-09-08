@@ -18,9 +18,6 @@
     "description": "Keep authorized targets, routes, imported services, quarantine, and engagement context in view",
     "category": "Security",
     "allowMultiple": false,
-    "defaultSection": "right",
-    "defaults": {
-      "panelWidth": 560
-    }
+    "defaultSection": "right"
   }
 }

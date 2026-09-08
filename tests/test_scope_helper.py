@@ -244,6 +244,37 @@ class ScopeHelperTests(unittest.TestCase):
         self.assertFalse(denied["allowed"])
         self.assertEqual(denied["scope"]["excludedBy"], ["!10.10.11.13"])
 
+
+    def test_state_permissions_are_repaired_on_read(self):
+        self.start()
+        state_file = self.state_home / "omarchy-scope" / "state.json"
+        state_file.chmod(0o644)
+        scope_helper.load_state()
+        self.assertEqual(stat.S_IMODE(state_file.stat().st_mode), 0o600)
+
+    def test_relative_xdg_state_home_is_refused(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "relative/state"}, clear=False):
+            with self.assertRaises(scope_helper.ScopeError) as ctx:
+                scope_helper.load_state()
+        self.assertEqual(ctx.exception.code, "unsafe-state-path")
+
+    def test_control_characters_are_removed_from_local_text(self):
+        self.start()
+        scope_helper.cmd_note(type("Args", (), {"text": "line1\nline2\tend"})())
+        message = scope_helper.load_state()["engagement"]["timeline"][-1]["message"]
+        self.assertEqual(message, "line1line2end")
+
+    def test_quarantine_reimport_preserves_prior_service_evidence(self):
+        self.start()
+        scan1 = Path(self.tmp.name) / "q-one.xml"
+        scan1.write_text(nmap_xml([{"ip": "192.168.1.20", "ports": [(80, "http")]}]), encoding="utf-8")
+        scan2 = Path(self.tmp.name) / "q-two.xml"
+        scan2.write_text(nmap_xml([{"ip": "192.168.1.20", "ports": [(443, "https")]}]), encoding="utf-8")
+        scope_helper.cmd_import_nmap(type("Args", (), {"path": str(scan1)})())
+        scope_helper.cmd_import_nmap(type("Args", (), {"path": str(scan2)})())
+        services = scope_helper.load_state()["engagement"]["quarantine"][0]["services"]
+        self.assertEqual([(x["port"], x["service"]) for x in services], [(80, "http"), (443, "https")])
+
     def test_end_stops_active_session_without_destroying_last_state(self):
         self.start()
         scope_helper.cmd_end(type("Args", (), {})())

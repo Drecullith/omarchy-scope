@@ -14,6 +14,7 @@ SCOPE is deliberately **not** a scanner or exploitation framework. It does not i
 - Import **explicitly supplied Nmap XML** without invoking Nmap itself.
 - Treat imported IP addresses as authoritative and hostnames/service names as untrusted metadata.
 - Put in-scope hosts into the target list and out-of-scope hosts into a non-actionable **Quarantine** section.
+- Surface Route Guard changes and quarantined evidence directly in the bar status; vertical bars collapse to a compact `S` marker.
 - Ignore Nmap `<script>` output in v0.1.
 - Scope-check every browser action immediately before producing the URL.
 - Capture a read-only route baseline for an exact in-scope IP and warn when the kernel route later changes.
@@ -69,8 +70,8 @@ Runtime commands used by SCOPE:
 
 - `python3`
 - `/usr/bin/ip` (Route Guard; if unavailable, route state is shown as `UNKNOWN`)
-- `xdg-open` (only after a scope-checked HTTP/HTTPS action)
-- `wl-copy` (copy target/port convenience)
+- `/usr/bin/xdg-open` (only after a scope-checked HTTP/HTTPS action)
+- `/usr/bin/wl-copy` (copy target/port convenience)
 
 SCOPE never installs those commands or modifies system packages. You can inspect local readiness without changing anything:
 
@@ -177,7 +178,7 @@ The helper and safety contract use only the Python standard library:
 python3 -m unittest discover -s tests -v
 ```
 
-Current tests cover:
+The current **27 automated tests** cover:
 
 - exact IP/CIDR/hostname/wildcard/exclusion semantics
 - exclusions winning over positive scope
@@ -212,7 +213,7 @@ Those are separate products and, in many cases, already have excellent tools. SC
 
 ## Status
 
-`0.1.0` is the first build candidate. The Python core is unit-tested; QML integration still needs validation on a real current Omarchy Quattro machine before marketplace submission or a stable release.
+`0.1.0` is the first build candidate. The Python core and static QML/security contracts are automated-test covered; QML rendering still needs validation on a real current Omarchy Quattro machine before marketplace submission or a stable release.
 
 ## License
 

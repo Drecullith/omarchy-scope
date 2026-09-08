@@ -16,6 +16,7 @@ Panel {
   readonly property color accentColor: Color.accent
   readonly property color urgentColor: Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property bool vertical: bar ? bar.vertical : false
   readonly property string helperPath: Qt.resolvedUrl("bin/scope-helper").toString().replace(/^file:\/\//, "")
 
   property bool active: false
@@ -39,6 +40,9 @@ Panel {
   readonly property var timeline: root.active && root.engagement && root.engagement.timeline ? root.engagement.timeline : []
   readonly property string primaryTarget: root.active && root.engagement ? (root.engagement.primaryTarget || "") : ""
   readonly property string barTarget: root.primaryTarget.length > 18 ? root.primaryTarget.substring(0, 15) + "…" : root.primaryTarget
+  readonly property bool barHasQuarantine: root.active && root.quarantined.length > 0
+  readonly property bool barHasRouteAlert: root.active && root.routeUrgent()
+  readonly property bool barAlert: root.barHasRouteAlert || root.barHasQuarantine
   readonly property var selectedTarget: root.targets.length > 0 && root.selectedTargetIndex >= 0 && root.selectedTargetIndex < root.targets.length
     ? root.targets[root.selectedTargetIndex]
     : null
@@ -137,7 +141,7 @@ Panel {
 
   function copyText(value) {
     if (!value) return
-    copyProc.command = ["wl-copy", String(value)]
+    copyProc.command = ["/usr/bin/wl-copy", String(value)]
     copyProc.running = true
     setFeedback("Copied", false)
   }
@@ -180,6 +184,23 @@ Panel {
     return !!route && route.verdict === "changed"
   }
 
+  function barLabel() {
+    if (root.vertical) return "S"
+    if (!root.active) return "SCOPE"
+    if (root.barHasRouteAlert) return "SCOPE · ROUTE ⚠"
+    if (root.barHasQuarantine) return "SCOPE · " + String(root.quarantined.length) + " QUARANTINED"
+    if (root.barTarget !== "") return "SCOPE · " + root.barTarget
+    return "SCOPE · ACTIVE"
+  }
+
+  function barTooltip() {
+    if (!root.active || !root.engagement) return "SCOPE · authorized engagement HUD"
+    var parts = [String(root.engagement.name || "SCOPE"), root.elapsed]
+    if (root.barHasRouteAlert) parts.push("ROUTE CHANGED")
+    if (root.barHasQuarantine) parts.push(String(root.quarantined.length) + " quarantined")
+    return parts.join(" · ")
+  }
+
   onOpenedChanged: {
     if (opened) {
       refreshStatus()
@@ -192,8 +213,8 @@ Panel {
   Timer {
     interval: 10000
     repeat: true
-    running: true
-    onTriggered: if (root.active) root.refreshStatus()
+    running: root.active
+    onTriggered: root.refreshStatus()
   }
 
   Timer {
@@ -286,7 +307,7 @@ Panel {
         root.setFeedback("OUT OF SCOPE — action refused", true)
         return
       }
-      browserProc.command = ["xdg-open", res.url]
+      browserProc.command = ["/usr/bin/xdg-open", res.url]
       browserProc.running = true
     }
   }
@@ -301,16 +322,14 @@ Panel {
     id: barButton
     anchors.fill: parent
     bar: root.bar
-    text: root.active
-      ? (root.barTarget !== "" ? "SCOPE · " + root.barTarget : "SCOPE · ACTIVE")
-      : "SCOPE"
+    text: root.barLabel()
     active: root.active
     useActiveColor: false
-    foreground: root.active ? root.accentColor : root.foreground
+    foreground: root.barAlert
+      ? root.urgentColor
+      : (root.active ? root.accentColor : (root.bar ? root.bar.barForeground : root.foreground))
     fontSize: Style.font.bodySmall
-    tooltipText: root.active && root.engagement
-      ? (root.engagement.name + " · " + root.elapsed)
-      : "SCOPE · authorized engagement HUD"
+    tooltipText: root.barTooltip()
 
     onPressed: function(b) {
       if (b === Qt.RightButton) root.refreshStatus()
@@ -363,6 +382,7 @@ Panel {
             implicitHeight: Math.max(heroMark.implicitHeight, heroLabels.implicitHeight, heroRefresh.implicitHeight)
 
             Text {
+              textFormat: Text.PlainText
               id: heroMark
               text: "S"
               color: root.active ? root.accentColor : root.foreground
@@ -383,6 +403,7 @@ Panel {
               spacing: Style.space(1)
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: root.active && root.engagement ? root.engagement.name : "SCOPE"
                 color: root.foreground
@@ -393,6 +414,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: root.active && root.engagement
                   ? String(root.engagement.kind || "ENGAGEMENT").toUpperCase() + " · " + root.elapsed
@@ -428,6 +450,7 @@ Panel {
             radius: Style.cornerRadius
 
             Text {
+              textFormat: Text.PlainText
               id: feedbackText
               anchors.left: parent.left
               anchors.right: parent.right
@@ -457,6 +480,7 @@ Panel {
               radius: Style.cornerRadius
 
               Text {
+                textFormat: Text.PlainText
                 id: introText
                 anchors.left: parent.left
                 anchors.right: parent.right
@@ -479,6 +503,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: "Name"
               color: root.foreground
               font.family: root.fontFamily
@@ -496,6 +521,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: "Type"
               color: root.foreground
               font.family: root.fontFamily
@@ -503,7 +529,8 @@ Panel {
               font.bold: true
             }
 
-            Row {
+            Flow {
+              width: parent.width
               spacing: Style.space(6)
               Repeater {
                 model: ["lab", "ctf", "client", "research"]
@@ -520,6 +547,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: "Authorization scope · one rule per line"
               color: root.foreground
               font.family: root.fontFamily
@@ -551,6 +579,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Exact IPs, strict CIDRs, exact hostnames, *.wildcards, and !exclusions. Exclusions always win. Host bits in CIDRs are rejected instead of silently widening scope."
               color: Qt.darker(root.foreground, 1.45)
@@ -572,6 +601,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "No sudo · no firewall changes · no listeners · no automatic scans · no credentials · no attack automation"
               color: Qt.darker(root.foreground, 1.5)
@@ -614,6 +644,7 @@ Panel {
                 RowLayout {
                   width: parent.width
                   Text {
+                    textFormat: Text.PlainText
                     text: root.primaryTarget !== "" ? root.primaryTarget : "AWAITING TARGET"
                     color: root.foreground
                     font.family: root.fontFamily
@@ -623,6 +654,7 @@ Panel {
                     elide: Text.ElideRight
                   }
                   Text {
+                    textFormat: Text.PlainText
                     text: root.primaryTarget !== "" ? "IN SCOPE ✓" : "SCOPE READY"
                     color: root.accentColor
                     font.family: root.fontFamily
@@ -644,6 +676,7 @@ Panel {
                       borderSpec: Border.controlSpec("normal", root.foreground, modelData.exclude ? root.urgentColor : root.accentColor)
                       radius: Style.cornerRadius
                       Text {
+                        textFormat: Text.PlainText
                         id: scopePillText
                         anchors.centerIn: parent
                         text: modelData.raw
@@ -677,6 +710,7 @@ Panel {
                   Layout.fillWidth: true
                   spacing: Style.space(1)
                   Text {
+                    textFormat: Text.PlainText
                     text: "ROUTE GUARD"
                     color: root.routeUrgent() ? root.urgentColor : root.foreground
                     font.family: root.fontFamily
@@ -684,6 +718,7 @@ Panel {
                     font.bold: true
                   }
                   Text {
+                    textFormat: Text.PlainText
                     width: parent.width
                     text: root.routeLabel()
                     color: root.routeUrgent() ? root.urgentColor : Qt.darker(root.foreground, 1.25)
@@ -720,6 +755,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.targets.length === 0
               width: parent.width
               text: "No in-scope targets imported yet. Drop an Nmap XML result below; SCOPE will parse it but never run the scan itself."
@@ -749,6 +785,7 @@ Panel {
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
+                    onEntered: root.selectTarget(index)
                     onClicked: root.selectTarget(index)
                   }
 
@@ -762,14 +799,18 @@ Panel {
                     spacing: Style.space(8)
 
                     Text {
+                      textFormat: Text.PlainText
                       text: modelData.address
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       font.bold: true
                       Layout.fillWidth: true
+                      Layout.minimumWidth: 0
+                      elide: Text.ElideMiddle
                     }
                     Text {
+                      textFormat: Text.PlainText
                       text: String(modelData.services ? modelData.services.length : 0) + " OPEN"
                       color: root.accentColor
                       font.family: root.fontFamily
@@ -802,12 +843,15 @@ Panel {
                 RowLayout {
                   width: parent.width
                   Text {
+                    textFormat: Text.PlainText
                     text: root.selectedTarget ? root.selectedTarget.address : ""
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.subtitle
                     font.bold: true
                     Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    elide: Text.ElideMiddle
                   }
                   Button {
                     visible: root.selectedTarget && root.selectedTarget.address !== root.primaryTarget
@@ -826,6 +870,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   visible: root.selectedTarget && root.selectedTarget.hostnames && root.selectedTarget.hostnames.length > 0
                   width: parent.width
                   text: root.selectedTarget && root.selectedTarget.hostnames ? root.selectedTarget.hostnames.join(" · ") : ""
@@ -898,6 +943,7 @@ Panel {
                 spacing: Style.space(6)
 
                 Text {
+                  textFormat: Text.PlainText
                   width: parent.width
                   text: importDrop.containsDrag ? "DROP NMAP XML" : "Drop an Nmap XML file here — or enter a path. Imported hosts are scope-checked before they become actionable."
                   color: importDrop.containsDrag ? root.accentColor : root.foreground
@@ -959,6 +1005,7 @@ Panel {
                   spacing: Style.space(4)
 
                   Text {
+                    textFormat: Text.PlainText
                     width: parent.width
                     text: "OUT OF SCOPE · ACTIONS DISABLED"
                     color: root.urgentColor
@@ -973,14 +1020,18 @@ Panel {
                       required property var modelData
                       width: parent.width
                       Text {
+                        textFormat: Text.PlainText
                         text: "⛔ " + modelData.address
                         color: root.urgentColor
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall
                         font.bold: true
                         Layout.fillWidth: true
+                        Layout.minimumWidth: 0
+                        elide: Text.ElideMiddle
                       }
                       Text {
+                        textFormat: Text.PlainText
                         text: String(modelData.services ? modelData.services.length : 0) + " services"
                         color: Qt.darker(root.foreground, 1.35)
                         font.family: root.fontFamily
@@ -1029,12 +1080,14 @@ Panel {
                   width: parent.width
                   spacing: Style.space(7)
                   Text {
+                    textFormat: Text.PlainText
                     text: String(modelData.at || "").substring(11, 19)
                     color: Qt.darker(root.foreground, 1.55)
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                   }
                   Text {
+                    textFormat: Text.PlainText
                     text: modelData.message || ""
                     color: modelData.type === "scope" ? root.accentColor : root.foreground
                     font.family: root.fontFamily
@@ -1057,6 +1110,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "SCOPE observes only its own state and explicitly imported evidence. It does not read shell history, terminal keystrokes, packet captures, or credentials."
               color: Qt.darker(root.foreground, 1.5)

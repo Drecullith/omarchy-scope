@@ -53,10 +53,12 @@ The only subprocess created by the Python helper is a bounded, argument-array in
 The QML surface may invoke:
 
 - `scope-helper` with argument arrays
-- `xdg-open <validated-http-or-https-url>` after Scope Guard approves the target
-- `wl-copy <text>` for explicit copy actions
+- `/usr/bin/xdg-open <validated-http-or-https-url>` after Scope Guard approves the target
+- `/usr/bin/wl-copy <text>` for explicit copy actions
 
-No user or imported string is concatenated into a shell command. Python uses no `shell=True`, `os.system`, or equivalent shell execution path.
+No user or imported string is concatenated into a shell command. Python uses no `shell=True`, `os.system`, or equivalent shell execution path. The UI uses fixed system paths for its two external convenience actions instead of resolving them through a mutable `PATH`.
+
+All built-in QML `Text` surfaces are forced to `Text.PlainText`, so engagement names, notes, filenames, and imported metadata cannot be interpreted as rich-text markup by the HUD. ASCII control characters are stripped from locally persisted display strings.
 
 ## Route Guard
 
@@ -77,6 +79,8 @@ State lives under `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-scope/`.
 - no-follow reads where available
 - ownership and regular-file checks
 - bounded JSON size
+- a relative `XDG_STATE_HOME` is refused instead of turning state storage into a working-directory-relative path
+- state file permissions are tightened back to `0600` when read
 
 SCOPE stores sanitized engagement metadata only. It does not store packet captures, credentials, browser cookies, shell history, terminal input, or complete imported XML.
 
